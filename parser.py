@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import re
 import time
+import xml.etree.ElementTree as ET
 from collections import OrderedDict
 from pathlib import Path
 from typing import Iterable, Optional
@@ -20,6 +22,12 @@ REQUEST_DELAY = 0.4
 TIMEOUT = 30
 MAX_PAGES = 5000
 MIN_TEXT_LENGTH = 120
+SITEMAP_INDEX_URL = f"{BASE_URL}/sitemap.xml"
+TOPIC_SITEMAP_CANDIDATES = (
+    "veterinary-topic.xml.gz",
+    "veterinary-topic.xml",
+)
+MAX_OUTPUT_PATH_LEN = 240
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -43,28 +51,6 @@ SKIP_URL_PARTS = (
     "/news",
 )
 
-KNOWN_SECTION_SLUGS = {
-    "behavior",
-    "circulatory-system",
-    "clinical-pathology-and-procedures",
-    "digestive-system",
-    "ear-disorders",
-    "emergency-medicine-and-critical-care",
-    "management-and-nutrition",
-    "metabolic-disorders",
-    "musculoskeletal-system",
-    "nervous-system",
-    "pharmacology",
-    "poultry",
-    "reproductive-system",
-    "respiratory-system",
-    "special-subjects",
-    "systemic-state-disorders",
-    "toxicology",
-    "urinary-system",
-}
-
-
 class MerckVetParser:
     def __init__(
         self,
@@ -82,6 +68,7 @@ class MerckVetParser:
         self.visited: set[str] = set()
         self.saved_pages = 0
         self.failed_urls: list[str] = []
+        self.allowed_path_roots: set[str] = set()
 
     def fetch_soup(self, url: str) -> BeautifulSoup:
         logging.info("GET %s", url)
@@ -95,13 +82,19 @@ class MerckVetParser:
         start_soup = self.fetch_soup(self.start_url)
         sections = self.extract_top_sections(start_soup)
         if not sections:
+            logging.info("Top-level sections were not found in page HTML; trying sitemap fallback.")
+            sections = self.extract_top_sections_from_sitemap()
+        if not sections:
             raise RuntimeError(
                 "Could not locate top-level sections on the start page. "
                 "The site markup may have changed or the page may be rendering differently."
             )
 
+        self.allowed_path_roots = self.collect_path_roots([self.start_url, *sections.values()])
         logging.info("Found %s top-level sections", len(sections))
         for title, url in sections.items():
+            if len(self.visited) >= self.max_pages:
+                break
             self.crawl(url=url, section_title=title, parent_trail=[title])
 
         logging.info("Saved pages: %s", self.saved_pages)
@@ -111,39 +104,45 @@ class MerckVetParser:
                 logging.warning("FAILED %s", bad_url)
 
     def crawl(self, url: str, section_title: str, parent_trail: list[str]) -> None:
-        url = self.normalize_url(url)
-        if not url or url in self.visited:
-            return
-        if len(self.visited) >= self.max_pages:
-            logging.warning("Reached max_pages=%s, stopping crawl.", self.max_pages)
-            return
+        stack: list[tuple[str, list[str]]] = [(url, parent_trail)]
 
-        self.visited.add(url)
-        try:
-            soup = self.fetch_soup(url)
-        except Exception as exc:  # noqa: BLE001
-            logging.exception("Failed to fetch %s: %s", url, exc)
-            self.failed_urls.append(url)
-            return
+        while stack:
+            if len(self.visited) >= self.max_pages:
+                logging.warning("Reached max_pages=%s, stopping crawl.", self.max_pages)
+                return
 
-        page_title = self.extract_page_title(soup) or parent_trail[-1]
-        breadcrumbs = self.extract_breadcrumbs(soup)
-        trail = self.build_trail(section_title, breadcrumbs, page_title, parent_trail)
+            current_url, current_trail = stack.pop()
+            current_url = self.normalize_url(current_url)
+            if not current_url or current_url in self.visited:
+                continue
 
-        article_text = self.extract_article_text(soup)
-        if article_text:
-            self.save_article(trail, article_text)
+            self.visited.add(current_url)
+            try:
+                soup = self.fetch_soup(current_url)
+            except Exception as exc:  # noqa: BLE001
+                logging.exception("Failed to fetch %s: %s", current_url, exc)
+                self.failed_urls.append(current_url)
+                continue
 
-        child_links = self.extract_child_links(soup, current_url=url)
-        if not child_links:
-            return
+            page_title = self.extract_page_title(soup) or current_trail[-1]
+            breadcrumbs = self.extract_breadcrumbs(soup)
+            trail = self.build_trail(section_title, breadcrumbs, page_title, current_trail)
 
-        for child_title, child_url in child_links.items():
-            child_trail = trail + [child_title]
-            self.crawl(url=child_url, section_title=section_title, parent_trail=child_trail)
+            article_text = self.extract_article_text(soup)
+            if article_text:
+                self.save_article(trail, article_text)
 
-    @staticmethod
-    def normalize_url(url: str) -> str:
+            child_links = self.extract_child_links(soup, current_url=current_url)
+            if not child_links:
+                continue
+
+            # Reverse for stable DFS order similar to recursive traversal.
+            child_items = list(child_links.items())
+            for child_title, child_url in reversed(child_items):
+                child_trail = trail + [child_title]
+                stack.append((child_url, child_trail))
+
+    def normalize_url(self, url: str) -> str:
         if not url:
             return ""
         absolute = urljoin(BASE_URL, url)
@@ -151,9 +150,18 @@ class MerckVetParser:
         parsed = urlparse(absolute)
         if parsed.netloc and "merckvetmanual.com" not in parsed.netloc:
             return ""
-        if not parsed.path.startswith(ALLOWED_PREFIX):
-            return ""
+        # Canonicalize URL to avoid revisiting the same page via tracking params.
+        parsed = parsed._replace(query="", params="")
+        absolute = parsed.geturl()
         if any(part in parsed.path.lower() for part in SKIP_URL_PARTS):
+            return ""
+        if self.allowed_path_roots:
+            path_root = self.extract_path_root(parsed.path)
+            if not path_root:
+                return ""
+            if path_root not in self.allowed_path_roots:
+                return ""
+        elif ALLOWED_PREFIX and not parsed.path.startswith(ALLOWED_PREFIX):
             return ""
         return absolute
 
@@ -232,15 +240,90 @@ class MerckVetParser:
             return False
 
         parsed = urlparse(href)
-        slug = parsed.path.rstrip("/").split("/")[-1].lower()
-        if slug in KNOWN_SECTION_SLUGS:
-            return True
-
         path_parts = [part for part in parsed.path.split("/") if part]
+        if len(path_parts) == 1:
+            return True
         if len(path_parts) == 2 and path_parts[0] == "veterinary-topics":
             return True
 
         return False
+
+    def extract_top_sections_from_sitemap(self) -> "OrderedDict[str, str]":
+        results: "OrderedDict[str, str]" = OrderedDict()
+
+        try:
+            sitemap_url = self.find_topic_sitemap_url()
+            if not sitemap_url:
+                return results
+            response = self.session.get(sitemap_url, timeout=TIMEOUT)
+            response.raise_for_status()
+            root = ET.fromstring(response.text)
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Failed to parse sitemap fallback: %s", exc)
+            return results
+
+        ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+        root_counts: dict[str, int] = {}
+        for loc in root.findall("sm:url/sm:loc", ns):
+            url = self.normalize_url_for_section_discovery(loc.text or "")
+            if not url:
+                continue
+            path_root = self.extract_path_root(urlparse(url).path)
+            if not path_root:
+                continue
+            root_counts[path_root] = root_counts.get(path_root, 0) + 1
+
+        for root_name, _ in sorted(root_counts.items(), key=lambda item: item[1], reverse=True):
+            title = root_name.replace("-", " ").title()
+            results[title] = urljoin(BASE_URL, f"/{root_name}")
+
+        return results
+
+    def find_topic_sitemap_url(self) -> str:
+        try:
+            response = self.session.get(SITEMAP_INDEX_URL, timeout=TIMEOUT)
+            response.raise_for_status()
+            root = ET.fromstring(response.text)
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Failed to load sitemap index: %s", exc)
+            return ""
+
+        ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+        for loc in root.findall("sm:sitemap/sm:loc", ns):
+            value = (loc.text or "").strip()
+            if not value:
+                continue
+            lowered = value.lower()
+            if any(candidate in lowered for candidate in TOPIC_SITEMAP_CANDIDATES):
+                return value
+        return ""
+
+    @staticmethod
+    def extract_path_root(path: str) -> str:
+        parts = [part for part in path.split("/") if part]
+        return parts[0].lower() if parts else ""
+
+    @staticmethod
+    def normalize_url_for_section_discovery(url: str) -> str:
+        if not url:
+            return ""
+        absolute = urljoin(BASE_URL, url)
+        absolute, _ = urldefrag(absolute)
+        parsed = urlparse(absolute)
+        if parsed.netloc and "merckvetmanual.com" not in parsed.netloc:
+            return ""
+        if any(part in parsed.path.lower() for part in SKIP_URL_PARTS):
+            return ""
+        return absolute
+
+    def collect_path_roots(self, urls: Iterable[str]) -> set[str]:
+        roots: set[str] = set()
+        for url in urls:
+            parsed = urlparse(urljoin(BASE_URL, url))
+            root = self.extract_path_root(parsed.path)
+            if root:
+                roots.add(root)
+        return roots
 
     def extract_child_links(self, soup: BeautifulSoup, current_url: str) -> "OrderedDict[str, str]":
         results: "OrderedDict[str, str]" = OrderedDict()
@@ -404,22 +487,64 @@ class MerckVetParser:
         return max(candidates, key=lambda tag: len(tag.get_text(" ", strip=True)))
 
     def save_article(self, trail: list[str], text: str) -> None:
+        sanitized = [self.safe_name(part, max_len=80) for part in trail]
+        compacted = self.compact_trail_for_path_limit(sanitized)
+
         directory = self.output_root
-        for part in trail:
-            directory /= self.safe_name(part)
-        directory.mkdir(parents=True, exist_ok=True)
+        for part in compacted:
+            directory /= part
         file_path = directory / "_index.txt"
-        file_path.write_text(text, encoding="utf-8")
+
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            file_path.write_text(text, encoding="utf-8")
+        except OSError:
+            # Last-resort fallback for Windows path limits.
+            digest = hashlib.sha1(" / ".join(sanitized).encode("utf-8")).hexdigest()[:16]
+            leaf = compacted[-1] if compacted else "untitled"
+            directory = self.output_root / "_by_hash" / f"{leaf}_{digest}"
+            directory.mkdir(parents=True, exist_ok=True)
+            file_path = directory / "_index.txt"
+            file_path.write_text(text, encoding="utf-8")
+
         self.saved_pages += 1
         logging.info("Saved %s", file_path)
 
+    def compact_trail_for_path_limit(self, parts: list[str]) -> list[str]:
+        if not parts:
+            return ["untitled"]
+
+        result = parts[:]
+        floor = 24
+        while self.output_file_path_len(result) > MAX_OUTPUT_PATH_LEN:
+            idx = max(range(len(result)), key=lambda i: len(result[i]))
+            current = result[idx]
+            if len(current) <= floor:
+                break
+            trimmed = current[: max(10, floor - 10)].rstrip(" .")
+            tag = hashlib.sha1(current.encode("utf-8")).hexdigest()[:8]
+            result[idx] = f"{trimmed}~{tag}"
+
+        if self.output_file_path_len(result) > MAX_OUTPUT_PATH_LEN:
+            digest = hashlib.sha1(" / ".join(parts).encode("utf-8")).hexdigest()[:12]
+            head = result[0] if result else "section"
+            tail = result[-1] if result else "article"
+            result = [self.safe_name(head, max_len=40), f"{self.safe_name(tail, max_len=40)}_{digest}"]
+
+        return result
+
+    def output_file_path_len(self, parts: list[str]) -> int:
+        path = (Path.cwd() / self.output_root / Path(*parts) / "_index.txt").resolve()
+        return len(str(path))
+
     @staticmethod
-    def safe_name(value: str) -> str:
+    def safe_name(value: str, max_len: int = 140) -> str:
         value = value.strip().replace("\u00a0", " ")
         value = re.sub(r'[\\/:*?"<>|]+', "_", value)
         value = re.sub(r"\s+", " ", value)
         value = value.rstrip(" .")
-        return value[:140] or "untitled"
+        value = value[:max_len].rstrip(" .")
+        return value or "untitled"
 
     @staticmethod
     def clean_text(value: str) -> str:
