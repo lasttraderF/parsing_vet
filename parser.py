@@ -51,6 +51,41 @@ SKIP_URL_PARTS = (
     "/news",
 )
 
+EXCLUDED_TOPIC_ROOTS = {
+    "all-other-pets",
+    "special-pet-topics",
+}
+
+ALLOWED_SECTION_ROOTS = {
+    "behavior",
+    "circulatory-system",
+    "clinical-pathology-and-procedures",
+    "digestive-system",
+    "ear-disorders",
+    "emergency-medicine-and-critical-care",
+    "endocrine-system",
+    "exotic-and-laboratory-animals",
+    "eye-diseases-and-disorders",
+    "generalized-conditions",
+    "immune-system",
+    "infectious-diseases",
+    "integumentary-system",
+    "management-and-nutrition",
+    "metabolic-disorders",
+    "musculoskeletal-system",
+    "nervous-system",
+    "pharmacology",
+    "poultry",
+    "public-health",
+    "reference-values-and-conversion-tables",
+    "reproductive-system",
+    "respiratory-system",
+    "special-subjects",
+    "therapeutics",
+    "toxicology",
+    "urinary-system",
+}
+
 class MerckVetParser:
     def __init__(
         self,
@@ -242,7 +277,7 @@ class MerckVetParser:
         parsed = urlparse(href)
         path_parts = [part for part in parsed.path.split("/") if part]
         if len(path_parts) == 1:
-            return True
+            return self.is_veterinary_topic_root(path_parts[0])
         if len(path_parts) == 2 and path_parts[0] == "veterinary-topics":
             return True
 
@@ -270,6 +305,8 @@ class MerckVetParser:
                 continue
             path_root = self.extract_path_root(urlparse(url).path)
             if not path_root:
+                continue
+            if not self.is_veterinary_topic_root(path_root):
                 continue
             root_counts[path_root] = root_counts.get(path_root, 0) + 1
 
@@ -321,9 +358,22 @@ class MerckVetParser:
         for url in urls:
             parsed = urlparse(urljoin(BASE_URL, url))
             root = self.extract_path_root(parsed.path)
-            if root:
+            if root and self.is_veterinary_topic_root(root):
                 roots.add(root)
         return roots
+
+    @staticmethod
+    def is_veterinary_topic_root(root: str) -> bool:
+        if not root:
+            return False
+        lowered = root.strip().lower()
+        if lowered == "veterinary-topics":
+            return True
+        if lowered.endswith("-owners"):
+            return False
+        if lowered in EXCLUDED_TOPIC_ROOTS:
+            return False
+        return lowered in ALLOWED_SECTION_ROOTS
 
     def extract_child_links(self, soup: BeautifulSoup, current_url: str) -> "OrderedDict[str, str]":
         results: "OrderedDict[str, str]" = OrderedDict()
