@@ -10,7 +10,7 @@ from typing import Iterable, Optional
 from urllib.parse import urljoin, urlparse, urldefrag
 
 import requests
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup, NavigableString, Tag
 
 BASE_URL = "https://www.merckvetmanual.com"
 DEFAULT_START_URL = f"{BASE_URL}/veterinary-topics"
@@ -43,6 +43,27 @@ SKIP_URL_PARTS = (
     "/news",
 )
 
+KNOWN_SECTION_SLUGS = {
+    "behavior",
+    "circulatory-system",
+    "clinical-pathology-and-procedures",
+    "digestive-system",
+    "ear-disorders",
+    "emergency-medicine-and-critical-care",
+    "management-and-nutrition",
+    "metabolic-disorders",
+    "musculoskeletal-system",
+    "nervous-system",
+    "pharmacology",
+    "poultry",
+    "reproductive-system",
+    "respiratory-system",
+    "special-subjects",
+    "systemic-state-disorders",
+    "toxicology",
+    "urinary-system",
+}
+
 
 class MerckVetParser:
     def __init__(
@@ -74,7 +95,10 @@ class MerckVetParser:
         start_soup = self.fetch_soup(self.start_url)
         sections = self.extract_top_sections(start_soup)
         if not sections:
-            raise RuntimeError("Could not locate top-level sections on the start page.")
+            raise RuntimeError(
+                "Could not locate top-level sections on the start page. "
+                "The site markup may have changed or the page may be rendering differently."
+            )
 
         logging.info("Found %s top-level sections", len(sections))
         for title, url in sections.items():
@@ -136,36 +160,87 @@ class MerckVetParser:
     def extract_top_sections(self, soup: BeautifulSoup) -> "OrderedDict[str, str]":
         results: "OrderedDict[str, str]" = OrderedDict()
 
-        heading = soup.find(
-            lambda tag: isinstance(tag, Tag)
-            and tag.name in {"h1", "h2", "h3", "h4"}
-            and tag.get_text(" ", strip=True).lower() == "sections"
-        )
-        candidate_containers: list[Tag] = []
-
-        if heading:
-            for sibling in heading.find_all_next(limit=12):
-                if sibling.name in {"h1", "h2", "h3", "h4"} and sibling is not heading:
-                    break
-                if isinstance(sibling, Tag):
-                    candidate_containers.append(sibling)
-
-        if not candidate_containers:
-            candidate_containers = [soup]
-
-        for container in candidate_containers:
+        for container in self.find_sections_containers(soup):
             for a in container.find_all("a", href=True):
                 title = self.clean_text(a.get_text(" ", strip=True))
                 href = self.normalize_url(a["href"])
                 if not title or not href:
                     continue
-                if title.lower() in SKIP_TEXT_EXACT:
-                    continue
-                if href == self.start_url:
+                if not self.is_top_section_link(title, href):
                     continue
                 results.setdefault(title, href)
 
+        if results:
+            return results
+
+        main = self.find_main_container(soup) or soup
+        for a in main.find_all("a", href=True):
+            title = self.clean_text(a.get_text(" ", strip=True))
+            href = self.normalize_url(a["href"])
+            if not title or not href:
+                continue
+            if not self.is_top_section_link(title, href):
+                continue
+            results.setdefault(title, href)
+
         return results
+
+    def find_sections_containers(self, soup: BeautifulSoup) -> list[Tag]:
+        containers: list[Tag] = []
+
+        for heading in soup.find_all(["h1", "h2", "h3", "h4", "h5", "strong", "span", "div", "p"]):
+            text = self.clean_text(heading.get_text(" ", strip=True)).lower()
+            if text != "sections":
+                continue
+            parent = heading.parent if isinstance(heading.parent, Tag) else None
+            if parent:
+                containers.append(parent)
+            containers.append(heading)
+            next_block = heading.find_next(["div", "section", "ul", "ol"])
+            if isinstance(next_block, Tag):
+                containers.append(next_block)
+
+        for text_node in soup.find_all(string=True):
+            if not isinstance(text_node, NavigableString):
+                continue
+            text = self.clean_text(str(text_node)).lower()
+            if text != "sections":
+                continue
+            parent = text_node.parent if isinstance(text_node.parent, Tag) else None
+            if parent:
+                containers.append(parent)
+                if isinstance(parent.parent, Tag):
+                    containers.append(parent.parent)
+
+        unique: list[Tag] = []
+        seen: set[int] = set()
+        for item in containers:
+            if not isinstance(item, Tag):
+                continue
+            marker = id(item)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            unique.append(item)
+        return unique
+
+    def is_top_section_link(self, title: str, href: str) -> bool:
+        title_lower = title.lower()
+        if title_lower in SKIP_TEXT_EXACT:
+            return False
+        if href == self.start_url:
+            return False
+
+        parsed = urlparse(href)
+        slug = parsed.path.rstrip("/").split("/")[-1].lower()
+        if slug in KNOWN_SECTION_SLUGS:
+            return True
+
+        path_parts = [part for part in parsed.path.split("/") if part]
+        if len(path_parts) == 2 and path_parts[0] == "veterinary-topics":
+            return True
+
+        return False
 
     def extract_child_links(self, soup: BeautifulSoup, current_url: str) -> "OrderedDict[str, str]":
         results: "OrderedDict[str, str]" = OrderedDict()
@@ -199,6 +274,10 @@ class MerckVetParser:
         if not title or len(title) > 180:
             return False
 
+        href = (anchor.get("href") or "").lower()
+        if href.endswith("#"):
+            return False
+
         for parent in anchor.parents:
             if not isinstance(parent, Tag):
                 continue
@@ -208,9 +287,10 @@ class MerckVetParser:
                     " ".join(parent.get("class", [])),
                     parent.get("data-testid", ""),
                     parent.get("role", ""),
+                    parent.get("aria-label", ""),
                 ]
             ).lower()
-            if any(keyword in attrs_blob for keyword in ("accordion", "expand", "section", "topic", "index", "tree", "list", "nav")):
+            if any(keyword in attrs_blob for keyword in ("accordion", "expand", "section", "topic", "index", "tree", "list", "nav", "menu")):
                 return True
             if parent.name in {"ul", "ol", "li", "details", "summary"}:
                 return True
