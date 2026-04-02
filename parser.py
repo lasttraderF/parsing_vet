@@ -56,7 +56,7 @@ EXCLUDED_TOPIC_ROOTS = {
     "special-pet-topics",
 }
 
-ALLOWED_SECTION_ROOTS = {
+ALLOWED_SECTION_ROOTS_ORDERED = [
     "behavior",
     "circulatory-system",
     "clinical-pathology-and-procedures",
@@ -84,7 +84,8 @@ ALLOWED_SECTION_ROOTS = {
     "therapeutics",
     "toxicology",
     "urinary-system",
-}
+]
+ALLOWED_SECTION_ROOTS = set(ALLOWED_SECTION_ROOTS_ORDERED)
 
 class MerckVetParser:
     def __init__(
@@ -126,8 +127,9 @@ class MerckVetParser:
             )
 
         self.allowed_path_roots = self.collect_path_roots([self.start_url, *sections.values()])
-        logging.info("Found %s top-level sections", len(sections))
-        for title, url in sections.items():
+        ordered_sections = self.order_sections(sections)
+        logging.info("Found %s top-level sections", len(ordered_sections))
+        for title, url in ordered_sections.items():
             if len(self.visited) >= self.max_pages:
                 break
             self.crawl(url=url, section_title=title, parent_trail=[title])
@@ -139,6 +141,7 @@ class MerckVetParser:
                 logging.warning("FAILED %s", bad_url)
 
     def crawl(self, url: str, section_title: str, parent_trail: list[str]) -> None:
+        section_root = self.extract_path_root(urlparse(urljoin(BASE_URL, url)).path)
         stack: list[tuple[str, list[str]]] = [(url, parent_trail)]
 
         while stack:
@@ -149,6 +152,9 @@ class MerckVetParser:
             current_url, current_trail = stack.pop()
             current_url = self.normalize_url(current_url)
             if not current_url or current_url in self.visited:
+                continue
+            current_root = self.extract_path_root(urlparse(current_url).path)
+            if section_root and current_root != section_root:
                 continue
 
             self.visited.add(current_url)
@@ -174,6 +180,9 @@ class MerckVetParser:
             # Reverse for stable DFS order similar to recursive traversal.
             child_items = list(child_links.items())
             for child_title, child_url in reversed(child_items):
+                child_root = self.extract_path_root(urlparse(urljoin(BASE_URL, child_url)).path)
+                if section_root and child_root != section_root:
+                    continue
                 child_trail = trail + [child_title]
                 stack.append((child_url, child_trail))
 
@@ -361,6 +370,25 @@ class MerckVetParser:
             if root and self.is_veterinary_topic_root(root):
                 roots.add(root)
         return roots
+
+    def order_sections(self, sections: "OrderedDict[str, str]") -> "OrderedDict[str, str]":
+        ordered: "OrderedDict[str, str]" = OrderedDict()
+        by_root: dict[str, tuple[str, str]] = {}
+        for title, url in sections.items():
+            root = self.extract_path_root(urlparse(url).path)
+            if not root:
+                continue
+            by_root.setdefault(root, (title, url))
+
+        for root in ALLOWED_SECTION_ROOTS_ORDERED:
+            pair = by_root.get(root)
+            if pair:
+                ordered[pair[0]] = pair[1]
+
+        for title, url in sections.items():
+            if title not in ordered:
+                ordered[title] = url
+        return ordered
 
     @staticmethod
     def is_veterinary_topic_root(root: str) -> bool:
